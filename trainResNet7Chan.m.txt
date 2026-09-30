@@ -1,0 +1,127 @@
+%% trainResNet7Chan.m
+% Phase 2: Train 7-channel ResNet-50 DR severity classifier on APTOS 2019.
+clear; clc; close all;
+
+%% ---- 1. Load index built by prepareAPTOSData.m (224x224x7 tensors) ----
+S = load('APTOS_7Channel_Index.mat', 'indexRows');
+indexRows = S.indexRows;
+classNames = {'No DR','Mild NPDR','Moderate NPDR','Severe NPDR','PDR'};
+labels = categorical(indexRows.diagnosis, 0:4, classNames);
+
+%% ---- 2. Train/validation split (stratified) ----
+rng(42);
+cv = cvpartition(labels, 'HoldOut', 0.2);
+trainIdx = training(cv);
+valIdx   = test(cv);
+trainFiles = indexRows.tensorPath(trainIdx);
+trainLabels = labels(trainIdx);
+valFiles = indexRows.tensorPath(valIdx);
+valLabels = labels(valIdx);
+
+%% ---- 3. Build datastores ----
+fdsTrain = fileDatastore(trainFiles, 'ReadFcn', @readAPTOSTensor, 'FileExtensions', '.mat');
+fdsTrain = transform(fdsTrain, @augmentTensor7);
+fdsVal   = fileDatastore(valFiles,   'ReadFcn', @readAPTOSTensor, 'FileExtensions', '.mat');
+labelDsTrain = arrayDatastore(trainLabels);
+labelDsVal   = arrayDatastore(valLabels);
+dsTrain = combine(fdsTrain, labelDsTrain);
+dsVal   = combine(fdsVal,   labelDsVal);
+
+%% ---- 4. Class weights calculation (Standard Normalized Inverse Frequency) ----
+counts = countcats(trainLabels);
+rawWeights = sum(counts) ./ (numel(counts) * counts);
+classWeights = sqrt(rawWeights);
+classWeights = classWeights / mean(classWeights);
+classWeights = classWeights(:)';
+
+%% ---- 5. Build the 7-channel ResNet-50 architecture ----
+lgraph = buildResNet7ChanModel(classNames, classWeights);
+
+%% ---- 6. Training options ----
+options = trainingOptions('adam', ...
+    'InitialLearnRate', 1e-4, ...
+    'L2Regularization', 0.005, ...
+    'MaxEpochs', 30, ...
+    'MiniBatchSize', 32, ...
+    'Shuffle', 'every-epoch', ...
+    'ValidationData', dsVal, ...
+    'ValidationFrequency', 50, ...
+    'OutputNetwork', 'best-validation-loss', ...   % new
+    'Verbose', true, ...
+    'Plots', 'training-progress', ...
+    'DispatchInBackground', true, ...
+    'ExecutionEnvironment', 'auto');
+%% ---- 7. Train ----
+[trainedNet, trainInfo] = trainNetwork(dsTrain, lgraph, options);
+
+%% ---- 8. Save trained model ----
+save('trainedResNet7Chan.mat', 'trainedNet', 'classNames', '-v7.3');
+disp('Saved trainedResNet7Chan.mat');
+
+%% ---- 9. Evaluate ----
+reset(dsVal);
+metrics = evaluateDRModel(trainedNet, dsVal, classNames);
+save('phase2_metrics.mat', 'metrics');
+
+% =========================================================================
+% MODEL ARCHITECTURE BUILDING FUNCTION
+% =========================================================================
+function lgraph = buildResNet7ChanModel(classNames, classWeights)
+net = resnet50;
+lgraph = layerGraph(net);
+
+% 1. Unfreeze res4 and res5 blocks
+for i = 1:numel(lgraph.Layers)
+    layer = lgraph.Layers(i);
+    if isprop(layer, 'WeightLearnRateFactor')
+        if startsWith(layer.Name, 'res5') || startsWith(layer.Name, 'bn5') || ...
+           startsWith(layer.Name, 'res4') || startsWith(layer.Name, 'bn4')
+            layer.WeightLearnRateFactor = 0.5;   
+            layer.BiasLearnRateFactor   = 0.5;
+        else
+            layer.WeightLearnRateFactor = 0.1;   
+            layer.BiasLearnRateFactor   = 0.1;
+        end
+        lgraph = replaceLayer(lgraph, layer.Name, layer);
+    end
+end
+
+% ---- Rebuild conv1 for 7-channel input ----
+oldConv1 = net.Layers(2);
+oldWeights = oldConv1.Weights;
+oldBias    = oldConv1.Bias;
+numFilters = size(oldWeights, 4);
+newWeights = zeros(7, 7, 7, numFilters, 'single');
+newWeights(:,:,1:3,:) = oldWeights;
+
+% CRITICAL FIX: Match weight magnitude of RGB channels (0.1) and boost conv1 learning rate factor (10)
+newWeights(:,:,4:7,:) = single(0.1 * randn(7,7,4,numFilters));
+
+newConv1 = convolution2dLayer(7, numFilters, ...
+    'Stride', 2, 'Padding', [3 3 3 3], ...
+    'Name', 'conv1', ...
+    'Weights', newWeights, 'Bias', oldBias, ...
+    'WeightLearnRateFactor', 10, 'BiasLearnRateFactor', 10); % <-- Boosted LR Factor
+
+lgraph = replaceLayer(lgraph, 'conv1', newConv1);
+
+% ---- Input layer ----
+newInput = imageInputLayer([224 224 7], ...
+    'Name', 'input_7chan', ...
+    'Normalization', 'none');
+lgraph = replaceLayer(lgraph, 'input_1', newInput);
+
+% ---- New 5-class head ----
+lgraph = removeLayers(lgraph, {'fc1000', 'fc1000_softmax', 'ClassificationLayer_fc1000'});
+numClasses = numel(classNames);
+
+newHead = [
+    fullyConnectedLayer(numClasses, 'Name', 'fc5_dr', ...
+        'WeightLearnRateFactor', 10, 'BiasLearnRateFactor', 10)
+    softmaxLayer('Name', 'softmax_dr')
+    classificationLayer('Name', 'classoutput_dr', ...
+        'Classes', classNames, 'ClassWeights', classWeights)
+];
+lgraph = addLayers(lgraph, newHead);
+lgraph = connectLayers(lgraph, 'avg_pool', 'fc5_dr');
+end
